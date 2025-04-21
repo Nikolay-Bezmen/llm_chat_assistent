@@ -4,6 +4,51 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from torch.nn import functional as F
 
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=512, base=10000, device=None):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        dtype = torch.get_default_dtype()
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=256):
+        if seq_len > self.max_seq_len_cached:
+            self.max_seq_len_cached = seq_len
+            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(x.dtype), persistent=False)
+            self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(x.dtype), persistent=False)
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+    
+    
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    b = [position_ids.shape, cos.shape, q.shape, k.shape]
+    cos = cos[position_ids.int()] # [bs, seq_len, dim]
+
+    sin = sin[position_ids.int()]  # [bs, seq_len, dim]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -16,11 +61,20 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
+        self.rotary_emb = RotaryEmbedding(head_size)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, T, _ = x.shape
+        assert len(x.shape) == 3, x.shape
+        
+        B, T, C = x.shape
         k = self.key(x)   # (B,T,hs)
         q = self.query(x)  # (B,T,hs)
+        
+        position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
+        cos, sin = self.rotary_emb(q)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        
         weights = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         weights = F.softmax(weights, dim=-1)
@@ -41,6 +95,7 @@ class MultiHeadAttention(nn.Module):
         ])
         self.projection = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
+        
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -87,7 +142,7 @@ class Block(nn.Module):
         return x
 
 
-class GPTLanguageModel(nn.Module):
+class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -105,7 +160,7 @@ class GPTLanguageModel(nn.Module):
         self.device = device
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        # self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[
             Block(n_embd, n_head, block_size, dropout)
             for _ in range(n_layer)
@@ -128,9 +183,7 @@ class GPTLanguageModel(nn.Module):
         B, T = input_tokens.shape
 
         token_embedding = self.token_embedding_table(input_tokens)
-        positional_embedding = self.position_embedding_table(
-            torch.arange(T, device=self.device))
-        x = token_embedding + positional_embedding
+        x = token_embedding
         x = self.blocks(x)
         x = self.final_layer_norm(x)
         logits = self.final_linear_layer(x)
