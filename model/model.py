@@ -4,6 +4,8 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from torch.nn import functional as F
 
+# seq_len_rot = 256
+
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=512, base=10000, device=None):
         super().__init__()
@@ -133,12 +135,12 @@ class Block(nn.Module):
             dropout=dropout
         )
         self.feed_forward = FeedFoward(n_embd, dropout)
-        self.layer_norm_1 = nn.LayerNorm(n_embd)
-        self.layer_norm_2 = nn.LayerNorm(n_embd)
+        self.rms_norm_1 = nn.RMSNorm(n_embd)
+        self.rms_norm_2 = nn.RMSNorm(n_embd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer_norm_1(x + self.self_attention(x))
-        x = self.layer_norm_2(x + self.feed_forward(x))
+        x = x + self.self_attention(self.rms_norm_1(x))
+        x = x + self.feed_forward(self.rms_norm_2(x))
         return x
 
 
@@ -160,7 +162,6 @@ class GPT(nn.Module):
         self.device = device
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        # self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[
             Block(n_embd, n_head, block_size, dropout)
             for _ in range(n_layer)
